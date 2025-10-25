@@ -22,13 +22,18 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
 # IMPORTANT: set these as environment variables on Render
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "PUT_TOKEN_HERE")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))  # your Telegram user id
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ADMIN_ID = os.environ.get("ADMIN_ID")
 
-# Path to Python executable to spawn child bots with same interpreter
-PY = sys.executable
+if not TELEGRAM_TOKEN or not ADMIN_ID:
+    print("❌ ERROR: Missing TELEGRAM_TOKEN or ADMIN_ID environment variables.")
+    print("Set them in Render → Environment → Environment Variables")
+    sys.exit(1)
 
-# ---------- helpers: load/save ----------
+ADMIN_ID = int(ADMIN_ID)
+PY = sys.executable  # Python executable
+
+# ---------- Helper Functions ----------
 def load_bots():
     if DB_FILE.exists():
         try:
@@ -40,32 +45,28 @@ def load_bots():
 def save_bots(data):
     DB_FILE.write_text(json.dumps(data, indent=2))
 
-# ---------- global state ----------
-bots = load_bots()  # structure: { "botname.py": {"path": "...", "pid": 123, "log": "logs/.."} }
-user_state = {}     # temporary per-user upload state
+bots = load_bots()
+user_state = {}
 
-# ---------- Launch/Stop functions ----------
+# ---------- Process Control ----------
 def start_bot_process(bot_path: str, bot_name: str):
-    """Start a bot.py as background process, redirect logs to files, return pid."""
     LOGS_DIR.mkdir(exist_ok=True)
     log_file = LOGS_DIR / f"{bot_name}.log"
     err_file = LOGS_DIR / f"{bot_name}.err"
 
-    # open files in append-binary mode and pass to Popen
-    lf = open(log_file, "ab")
-    ef = open(err_file, "ab")
-
-    # spawn process; keep stdout/stderr to files
-    proc = subprocess.Popen([PY, bot_path],
-                            stdout=lf,
-                            stderr=ef,
-                            cwd=str(Path(bot_path).parent),
-                            preexec_fn=os.setsid)  # create new process group
-    return proc.pid, str(log_file), str(err_file), lf, ef
+    with open(log_file, "ab") as lf, open(err_file, "ab") as ef:
+        proc = subprocess.Popen(
+            [PY, bot_path],
+            stdout=lf,
+            stderr=ef,
+            cwd=str(Path(bot_path).parent),
+            preexec_fn=os.setsid
+        )
+    return proc.pid, str(log_file), str(err_file)
 
 def stop_bot_process(pid: int):
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)  # kill process group
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
         return True
     except Exception:
         try:
@@ -74,30 +75,30 @@ def stop_bot_process(pid: int):
         except Exception:
             return False
 
-# ---------- Auto-restart on start ----------
 def auto_restart_bots():
     if not bots:
         print("No saved bots to restart.")
         return
-    print("Auto-restarting saved bots...")
+    print("🔁 Auto-restarting saved bots...")
     for name, info in list(bots.items()):
         path = info.get("path")
         if path and Path(path).exists():
             try:
-                pid, log, err, lf, ef = start_bot_process(path, name)
-                info["pid"] = pid
-                info["log"] = log
-                info["err"] = err
-                print(f"Started {name} -> PID {pid}")
+                pid, log, err = start_bot_process(path, name)
+                info.update({"pid": pid, "log": log, "err": err})
+                print(f"✅ Started {name} → PID {pid}")
             except Exception as e:
-                print(f"Failed to start {name}: {e}")
+                print(f"❌ Failed to start {name}: {e}")
         else:
-            print(f"Bot file missing for {name}, removing from db.")
+            print(f"⚠️ Missing file for {name}, removing from db.")
             bots.pop(name, None)
     save_bots(bots)
 
-# ---------- Telegram handlers ----------
+# ---------- Telegram Handlers ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return await update.message.reply_text("❌ You are not authorized to use this bot.")
+
     kb = [
         [InlineKeyboardButton("🚀 Deploy Bot", callback_data="deploy")],
         [InlineKeyboardButton("📋 Active Bots", callback_data="list")],
@@ -105,206 +106,141 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛑 Stop All Bots", callback_data="stop_all")],
         [InlineKeyboardButton("🔁 Restart All", callback_data="restart_all")]
     ]
-    await update.message.reply_text("Hello — Bot Deployer (Render)\nChoose:", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("🤖 Render Bot Deployer\nChoose an option:", reply_markup=InlineKeyboardMarkup(kb))
 
 def is_admin(update: Update):
     try:
-        uid = update.effective_user.id
-        return uid == ADMIN_ID
+        return update.effective_user.id == ADMIN_ID
     except Exception:
         return False
 
 async def cb_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user = query.from_user.id
-    if user != ADMIN_ID:
-        await query.message.reply_text("❌ You are not authorized to use this deployer.")
-        return
+    if not is_admin(update):
+        return await query.message.reply_text("❌ Not authorized.")
 
     data = query.data
     if data == "deploy":
-        user_state[user] = {"step": "ask_bot"}
+        user_state[ADMIN_ID] = {"step": "ask_bot"}
         await query.message.reply_text("📤 Please upload your bot.py file (as a Document).")
+
     elif data == "list":
         if not bots:
-            await query.message.reply_text("📭 No active bots.")
-        else:
-            txt = "🤖 Active bots:\n"
-            for name, info in bots.items():
-                txt += f"• {name} — PID: {info.get('pid','?')}\n"
-            await query.message.reply_text(txt)
+            return await query.message.reply_text("📭 No active bots.")
+        msg = "\n".join(f"• {n} — PID: {b.get('pid')}" for n, b in bots.items())
+        await query.message.reply_text(f"🤖 Active Bots:\n{msg}")
+
     elif data == "stop_all":
         count = 0
-        for name, info in list(bots.items()):
+        for _, info in list(bots.items()):
             pid = info.get("pid")
             if pid and stop_bot_process(pid):
                 count += 1
         bots.clear()
         save_bots(bots)
         await query.message.reply_text(f"🛑 Stopped {count} bots.")
+
     elif data == "restart_all":
         count = 0
         for name, info in list(bots.items()):
             path = info.get("path")
             if path and Path(path).exists():
-                pid, log, err, lf, ef = start_bot_process(path, name)
-                info["pid"] = pid
-                info["log"] = log
-                info["err"] = err
+                pid, log, err = start_bot_process(path, name)
+                info.update({"pid": pid, "log": log, "err": err})
                 count += 1
         save_bots(bots)
         await query.message.reply_text(f"🔁 Restarted {count} bots.")
+
     elif data == "view_logs":
         if not bots:
-            await query.message.reply_text("📭 No bots (no logs).")
-            return
-        # create buttons per bot to fetch logs
-        kb = []
-        for name in bots.keys():
-            kb.append([InlineKeyboardButton(name, callback_data=f"log__{name}")])
-        await query.message.reply_text("Select a bot to view recent logs:", reply_markup=InlineKeyboardMarkup(kb))
+            return await query.message.reply_text("📭 No bots running.")
+        kb = [[InlineKeyboardButton(name, callback_data=f"log__{name}")] for name in bots.keys()]
+        await query.message.reply_text("Select a bot to view logs:", reply_markup=InlineKeyboardMarkup(kb))
+
     elif data.startswith("log__"):
-        name = data.split("log__",1)[1]
+        name = data.split("log__", 1)[1]
         info = bots.get(name)
-        if not info:
-            await query.message.reply_text("Bot not found.")
-            return
-        logpath = info.get("log")
-        if not logpath or not Path(logpath).exists():
-            await query.message.reply_text("Log file not found.")
-            return
-        # send last 80 lines
-        try:
-            with open(logpath, "rb") as f:
-                content = f.read().decode(errors="replace").splitlines()
-                tail = "\n".join(content[-80:]) or "(empty)"
-                if len(tail) > 3900:
-                    tail = tail[-3900:]
-                await query.message.reply_text(f"📄 Last lines of {name}:\n<pre>{tail}</pre>", parse_mode="HTML")
-        except Exception as e:
-            await query.message.reply_text(f"Could not read log: {e}")
+        if not info or not Path(info.get("log", "")).exists():
+            return await query.message.reply_text("⚠️ Log not found.")
+        lines = Path(info["log"]).read_text(errors="replace").splitlines()
+        text = "\n".join(lines[-80:]) or "(empty)"
+        if len(text) > 3900:
+            text = text[-3900:]
+        await query.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
 
 async def doc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user.id
-    if user != ADMIN_ID:
-        await update.message.reply_text("❌ You are not authorized.")
-        return
+    if not is_admin(update):
+        return await update.message.reply_text("❌ Not authorized.")
 
-    if user not in user_state:
-        await update.message.reply_text("⚠️ First press Deploy and follow prompts.")
-        return
-
-    step = user_state[user]["step"]
     doc = update.message.document
     if not doc:
-        await update.message.reply_text("Please send the file as Document.")
-        return
+        return await update.message.reply_text("Please send the file as Document.")
 
-    if step == "ask_bot":
-        # save bot file
-        filename = doc.file_name
-        if not filename.endswith(".py"):
-            await update.message.reply_text("⚠️ Please upload a .py file (bot.py).")
-            return
-        dest = UPLOAD_DIR / f"{user}_{filename}"
+    state = user_state.get(ADMIN_ID, {})
+    if state.get("step") == "ask_bot":
+        dest = UPLOAD_DIR / f"{ADMIN_ID}_{doc.file_name}"
         await doc.download_to_drive(str(dest))
-        user_state[user]["bot_path"] = str(dest)
-        user_state[user]["step"] = "ask_req"
-        await update.message.reply_text("✅ bot.py received. Now upload requirements.txt (or send 'none').")
-    elif step == "ask_req":
-        # accept requirements or the word 'none'
-        filename = doc.file_name
-        if filename.lower().endswith("requirements.txt") or filename.lower().endswith(".txt"):
-            dest = UPLOAD_DIR / f"{user}_requirements.txt"
+        user_state[ADMIN_ID].update({"bot_path": str(dest), "step": "ask_req"})
+        await update.message.reply_text("✅ bot.py uploaded. Now upload requirements.txt (or send 'none').")
+
+    elif state.get("step") == "ask_req":
+        if doc.file_name.endswith(".txt"):
+            dest = UPLOAD_DIR / f"{ADMIN_ID}_requirements.txt"
             await doc.download_to_drive(str(dest))
-            user_state[user]["req_path"] = str(dest)
-            await update.message.reply_text("📦 requirements received. Installing & deploying...")
-            await finalize_deploy(update, user)
+            user_state[ADMIN_ID]["req_path"] = str(dest)
+            await update.message.reply_text("📦 Installing requirements...")
+            await finalize_deploy(update)
         else:
-            await update.message.reply_text("Please upload a requirements.txt file (or send a message 'none').")
+            await update.message.reply_text("Upload requirements.txt or send 'none'.")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user.id
-    if user != ADMIN_ID:
+    if not is_admin(update):
         return
-    if user in user_state and user_state[user].get("step") == "ask_req":
-        # allow sending 'none' to skip requirements
-        txt = (update.message.text or "").strip().lower()
-        if txt == "none":
-            await update.message.reply_text("📦 Skipping requirements. Deploying...")
-            await finalize_deploy(update, user)
-        else:
-            await update.message.reply_text("If you don't have requirements.txt, send 'none'. Otherwise upload the requirements.txt as Document.")
+    txt = update.message.text.strip().lower()
+    if txt == "none" and ADMIN_ID in user_state:
+        await finalize_deploy(update)
 
-async def finalize_deploy(update: Update, user_id: int):
-    info = user_state[user_id]
+async def finalize_deploy(update: Update):
+    info = user_state[ADMIN_ID]
     bot_path = info.get("bot_path")
     req_path = info.get("req_path")
-    if not bot_path or not Path(bot_path).exists():
-        await update.message.reply_text("Bot file missing. Aborting.")
-        user_state.pop(user_id, None)
-        return
 
-    # Install requirements if provided
     if req_path and Path(req_path).exists():
-        try:
-            await update.message.reply_text("Installing requirements (this may take a while)...")
-            # run pip install -r <req> in a subprocess (blocking)
-            proc = subprocess.run([PY, "-m", "pip", "install", "-r", req_path], capture_output=True, text=True)
-            if proc.returncode != 0:
-                await update.message.reply_text(f"⚠️ pip install failed:\n<pre>{proc.stderr[-1500:]}</pre>", parse_mode="HTML")
-            else:
-                await update.message.reply_text("✅ requirements installed.")
-        except Exception as e:
-            await update.message.reply_text(f"pip install error: {e}")
+        proc = subprocess.run([PY, "-m", "pip", "install", "-r", req_path], capture_output=True, text=True)
+        if proc.returncode == 0:
+            await update.message.reply_text("✅ Requirements installed.")
+        else:
+            await update.message.reply_text(f"⚠️ pip error:\n<pre>{proc.stderr[-1500:]}</pre>", parse_mode="HTML")
 
-    # start bot process
     bot_name = Path(bot_path).name
-    try:
-        pid, log, err, lf, ef = start_bot_process(bot_path, bot_name)
-        bots[bot_name] = {"path": str(bot_path), "pid": pid, "log": log, "err": err}
-        save_bots(bots)
-        await update.message.reply_text(f"🚀 {bot_name} started (PID: {pid}).")
-    except Exception as e:
-        await update.message.reply_text(f"Failed to start bot: {e}")
+    pid, log, err = start_bot_process(bot_path, bot_name)
+    bots[bot_name] = {"path": str(bot_path), "pid": pid, "log": log, "err": err}
+    save_bots(bots)
+    user_state.pop(ADMIN_ID, None)
+    await update.message.reply_text(f"🚀 {bot_name} started successfully! (PID: {pid})")
 
-    user_state.pop(user_id, None)
-
-# ---------- Setup Telegram Application (run in thread) ----------
+# ---------- Threads ----------
 def run_telegram():
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(CallbackQueryHandler(cb_query))
-    application.add_handler(MessageHandler(filters.Document.ALL, doc_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    print("Starting Telegram bot (polling)...")
-    application.run_polling(poll_interval=1.0)
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(cb_query))
+    app.add_handler(MessageHandler(filters.Document.ALL, doc_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    print("✅ Telegram polling started.")
+    app.run_polling(poll_interval=1.0)
 
-# ---------- Flask app for healthcheck ----------
+# ---------- Flask ----------
 flask_app = Flask("deployer")
 
 @flask_app.route("/")
 def index():
-    return jsonify({"status":"ok","bots_saved": len(bots)})
+    return jsonify({"status": "ok", "active_bots": len(bots)})
 
-# ---------- Entrypoint ----------
+# ---------- MAIN ----------
 if __name__ == "__main__":
-    if TELEGRAM_TOKEN == "PUT_TOKEN_HERE" or ADMIN_ID == 0:
-        print("ERROR: Set TELEGRAM_TOKEN and ADMIN_ID environment variables before running.")
-        print("Example: export TELEGRAM_TOKEN=xxxxx; export ADMIN_ID=123456789")
-        sys.exit(1)
-
-    # auto-restart saved bots
     auto_restart_bots()
-
-    # start telegram in thread
-    t = threading.Thread(target=run_telegram, daemon=True)
-    t.start()
-
-    # run flask (main process). On Render you will use `python render_deployer.py`
-    # Flask will keep process alive and serve healthcheck at '/'
-    print("Starting Flask webserver for healthcheck on port 8000...")
-    # Render sets PORT env var; fall back to 8000
+    threading.Thread(target=run_telegram, daemon=True).start()
     port = int(os.environ.get("PORT", "8000"))
+    print(f"🌐 Flask running on port {port}")
     flask_app.run(host="0.0.0.0", port=port)
