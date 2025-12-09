@@ -17,29 +17,72 @@ import sys
 import atexit
 import requests
 
-# --- Flask Keep Alive ---
-from flask import Flask
-from threading import Thread
+# --- Flask Keep Alive Improvement ---
+from flask import Flask, request
+import threading
+import time
 
 app = Flask('')
 
+# Global variable to track last activity
+last_activity_time = time.time()
+WAKEUP_INTERVAL = 300  # 5 minutes - Ping every 5 minutes to prevent sleep
+
 @app.route('/')
 def home():
-    return "RS_HIST_BOT"
+    global last_activity_time
+    last_activity_time = time.time()
+    return "🤖 RS_HIST_BOT is running!\n📞 Webhook: /webhook\n👤 Owner: @RS_WONER\n⏰ Last active: " + time.ctime(last_activity_time)
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    global last_activity_time
+    last_activity_time = time.time()
+    
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return 'OK', 200
+    return 'Bad Request', 400
 
-def keep_alive():
-    t = Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-    print("Flask Keep-Alive server started.")
+@app.route('/ping')
+def ping():
+    global last_activity_time
+    last_activity_time = time.time()
+    return f"Pong! ✅ Bot is awake. Last activity: {time.ctime(last_activity_time)}"
+
+@app.route('/status')
+def status():
+    global last_activity_time
+    uptime = time.time() - last_activity_time
+    return f"""
+    Bot Status:
+    ✅ Running: Yes
+    📅 Uptime: {uptime:.0f} seconds
+    ⏰ Last Activity: {time.ctime(last_activity_time)}
+    🔗 Webhook: /webhook
+    🏓 Ping: /ping
+    """
+
+# Auto-ping system to keep awake
+def auto_ping():
+    """Automatically ping the server every 5 minutes to prevent sleep"""
+    import requests
+    
+    while True:
+        time.sleep(WAKEUP_INTERVAL)
+        try:
+            # Ping own server to keep it awake
+            response = requests.get(f"https://rs-clone-mhzw.onrender.com/ping", timeout=10)
+            logger.info(f"🔄 Auto-ping sent. Status: {response.status_code}")
+        except Exception as e:
+            logger.error(f"⚠️ Auto-ping failed: {e}")
+
 # --- End Flask Keep Alive ---
 
 # --- Configuration ---
-TOKEN = '8272754175:AAHuLGphdeVjRoIMPJRAPz1yI006NgGYAZA'
+TOKEN = os.environ.get('BOT_TOKEN')
 OWNER_ID = 6621572366
 ADMIN_ID = 6621572366
 YOUR_USERNAME = '@RS_WONER'
@@ -2320,21 +2363,42 @@ if __name__ == '__main__':
     logger.info("=" * 40 + "\n🤖 Bot Starting Up...\n" + f"🐍 Python: {3.12}\n" +
                 f"🔧 Base Dir: {BASE_DIR}\n📁 Upload Dir: {UPLOAD_BOTS_DIR}\n" +
                 f"📊 Data Dir: {IROTECH_DIR}\n🔑 Owner ID: {OWNER_ID}\n🛡️ Admins: {admin_ids}\n" + "=" * 40)
-    keep_alive()
-    logger.info("🚀 Starting polling...")
-    while True:
-        try:
-            bot.infinity_polling(logger_level=logging.INFO, timeout=60, long_polling_timeout=30)
-        except requests.exceptions.ReadTimeout:
-            logger.warning("Polling ReadTimeout. Restarting in 5s...")
-            time.sleep(5)
-        except requests.exceptions.ConnectionError as ce:
-            logger.error(f"Polling ConnectionError: {ce}. Retrying in 15s...")
-            time.sleep(15)
-        except Exception as e:
-            logger.critical(f"💥 Unrecoverable polling error: {e}", exc_info=True)
-            logger.info("Restarting polling in 30s due to critical error...")
-            time.sleep(30)
-        finally:
-            logger.warning("Polling attempt finished. Will restart if in loop.")
-            time.sleep(1)
+    
+    # Use your specific Render URL
+    RENDER_URL = "https://rs-clone-mhzw.onrender.com"
+    WEBHOOK_PATH = "/webhook"
+    
+    # Step 1: Start auto-ping thread (to prevent sleep)
+    auto_ping_thread = threading.Thread(target=auto_ping, daemon=True)
+    auto_ping_thread.start()
+    logger.info("🔄 Auto-ping thread started (prevents 15min sleep)")
+    
+    # Step 2: Configure webhook
+    try:
+        logger.info(f"🌐 Configuring webhook for Render...")
+        
+        # Delete old webhook
+        bot.remove_webhook()
+        time.sleep(2)
+        
+        # Set new webhook
+        webhook_url = f"{RENDER_URL}{WEBHOOK_PATH}"
+        logger.info(f"🔄 Setting webhook to: {webhook_url}")
+        
+        success = bot.set_webhook(url=webhook_url)
+        if success:
+            logger.info("✅ Webhook configured successfully!")
+        else:
+            logger.error("❌ Failed to set webhook!")
+            
+    except Exception as e:
+        logger.error(f"⚠️ Webhook setup error: {e}")
+    
+    # Step 3: Start Flask server
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"🚀 Starting server on port {port}...")
+    logger.info(f"🔗 Webhook URL: {RENDER_URL}{WEBHOOK_PATH}")
+    logger.info(f"🏓 Ping URL: {RENDER_URL}/ping")
+    logger.info(f"📊 Status: {RENDER_URL}/status")
+    
+    app.run(host='0.0.0.0', port=port)
