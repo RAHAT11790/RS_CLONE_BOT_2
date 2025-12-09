@@ -19,14 +19,12 @@ import requests
 
 # --- Flask Keep Alive Improvement ---
 from flask import Flask, request
-import threading
-import time
 
 app = Flask('')
 
 # Global variable to track last activity
-last_activity_time = time.time()
-WAKEUP_INTERVAL = 300  # 5 minutes - Ping every 5 minutes to prevent sleep
+last_activity_time = time.time()  # 'time' already imported above
+WAKEUP_INTERVAL = 300  # 5 minutes
 
 @app.route('/')
 def home():
@@ -42,7 +40,7 @@ def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
+        bot.process_new_updates([update])  # ✅ 'bot' is global
         return 'OK', 200
     return 'Bad Request', 400
 
@@ -68,8 +66,6 @@ def status():
 # Auto-ping system to keep awake
 def auto_ping():
     """Automatically ping the server every 5 minutes to prevent sleep"""
-    import requests
-    
     while True:
         time.sleep(WAKEUP_INTERVAL)
         try:
